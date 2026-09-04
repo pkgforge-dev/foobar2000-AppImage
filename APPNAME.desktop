@@ -1,0 +1,38 @@
+[Desktop Entry]
+Name=APPNAME
+GenericName=
+Comment=
+Type=Application
+Terminal=false
+Actions=PlayPause;Stop;Next;Prev;Random;Config
+Encoding=UTF-8
+Version=
+Icon=APPNAME
+Exec=APPNAME %F
+StartupWMClass=MAIN_EXE_HERE
+Categories=
+MimeType=
+
+[Desktop Action PlayPause]
+Name=Play/Pause
+Exec=APPNAME /playpause
+
+[Desktop Action Stop]
+Name=Stop
+Exec=APPNAME /stop
+
+[Desktop Action Next]
+Name=Next
+Exec=APPNAME /next
+
+[Desktop Action Prev]
+Name=Prev
+Exec=APPNAME /prev
+
+[Desktop Action Random]
+Name=Random
+Exec=APPNAME /rand
+
+[Desktop Action Config]
+Name=Preferences
+Exec=APPNAME /config

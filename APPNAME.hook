@@ -1,0 +1,522 @@
+#!/bin/sh
+
+# APPNAME hook — sourced by AppRun via AppRun.lib
+# Assumes get-wine-appimage.hook has already ensured wine is available
+# and added $DATADIR/wine-appimage/bin to PATH.
+#
+# Layout: $DATADIR/wine-appimage/{bin,apps/APPNAME,wine-*.AppImage,.target}
+#
+# Replace APPNAME_HERE / MAIN_EXE_HERE / VERSION_HERE placeholders via
+# make-appimage.sh's sed patches.
+#
+# Available from AppRun.lib: notify, download, is_cmd, APPDIR,
+# DATADIR, CACHEDIR, HOST_HOME, APPIMAGE_ARCH, HOSTPATH
+
+if [ "$APPRUN_DEBUG" = 1 ]; then
+	exec 3>&2
+else
+	exec 3>/dev/null
+fi
+
+# APP
+_APP_NAME="APPNAME_HERE"
+_APP_VER="VERSION_HERE"
+_APP_REAL="$APPDIR/share/$_APP_NAME"
+_APP_HOME="$DATADIR/wine-appimage/apps/$_APP_NAME"
+export DATADIR
+_APP_BIN="MAIN_EXE_HERE"
+_APP_ICOD="$DATADIR/applications/$_APP_NAME.desktop"
+_APP_ICON_FIX="$DATADIR/applications/fix_icon_wine_$_APP_NAME.desktop"
+
+# WINE — prefer the real wine-AppImage path (not the shell wrappers in
+# wine-appimage/bin/). Winetricks uses `file` on $WINE / wineserver and
+# reports "Unknown file arch" if those are the .run scripts.
+_WINE_TOOLS_DIR="${DATADIR}/wine-appimage/bin"
+if [ -n "${WINE_APPIMAGE_PATH:-}" ] && [ -x "$WINE_APPIMAGE_PATH" ]; then
+	_app_wine_bin="$WINE_APPIMAGE_PATH"
+elif [ -x "$_WINE_TOOLS_DIR/wine" ]; then
+	_app_wine_bin="$_WINE_TOOLS_DIR/wine"
+elif command -v wine >/dev/null 2>&1; then
+	_app_wine_bin=$(command -v wine)
+else
+	echo "ERROR: No wine-AppImage found. Ensure get-wine-appimage.hook" >&2
+	echo "is present, or install pkgforge-dev/wine-AppImage manually:" >&2
+	echo "https://github.com/pkgforge-dev/wine-AppImage" >&2
+	exit 1
+fi
+export WINE="$_app_wine_bin"
+
+_APP_WINEPREFIX_SUBDIR="WINEPREFIX_SUBDIR_HERE"
+export WINEPREFIX="${WINEPREFIX:-"$_APP_HOME/$_APP_WINEPREFIX_SUBDIR"}"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-"WINEDLLOVERRIDES_HERE"}"
+export WINEDEBUG="${WINEDEBUG:-"WINEDEBUG_HERE"}"
+
+# Shared AppImage: leave WINESERVER unset so wine finds sibling
+# bin/wineserver inside the mount.
+unset WINESERVER
+export WINE_HOST_XDG_CACHE_HOME="${HOST_XDG_CACHE_HOME:-${HOME}/.cache}"
+export XDG_CACHE_HOME="$WINE_HOST_XDG_CACHE_HOME"
+export WINELOADER="${WINELOADER:-"$_app_wine_bin"}"
+# Do not export DISABLE_AUTO_UPDATES here — that would disable this
+# consumer AppImage's self-updater. Set it only on the wine-AppImage exec.
+
+case "$1" in
+	winetricks)
+		# Clear WINE/WINELOADER so winetricks uses the real ELF binaries
+		# from the wine-AppImage mount (PATH puts that bin/ first), not
+		# our outer shell wrappers. Drop any stale wineserver for this
+		# prefix first — otherwise winetricks' `wineserver -w` can hang
+		# forever waiting on orphaned processes from a previous run.
+		shift
+		_wai="${WINE_APPIMAGE_PATH:-$WINELOADER}"
+		DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+			"$_wai" wineserver -k >/dev/null 2>&1 || true
+		DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+			exec "$_wai" winetricks "$@"
+		;;
+	regedit|winecfg|wineconsole|winefile|wineboot|wineserver|winepath|msiexec|notepad)
+		_app_subcmd="$1"
+		shift
+		DISABLE_AUTO_UPDATES=1 \
+			exec "${WINE_APPIMAGE_PATH:-$WINELOADER}" "$_app_subcmd" "$@"
+		;;
+esac
+
+# DXVK
+export DXVK_HUD="${DXVK_HUD:-"0"}"
+export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-"none"}"
+export DXVK_STATE_CACHE="${DXVK_STATE_CACHE:-"0"}"
+export DXVK_CONFIG_FILE="${DXVK_CONFIG_FILE:-"$_APP_HOME/dxvk.conf"}"
+
+# Filter Mesa EGL/DRI logs to fatal only
+export EGL_LOG_LEVEL="${EGL_LOG_LEVEL:-"fatal"}"
+
+[ -d "$_APP_HOME" ] || mkdir -p "$_APP_HOME" || exit 1
+
+_app_synced_ver_file="$_APP_HOME/.synced-version"
+if [ -d "$_APP_REAL" ] && { [ ! -f "$_app_synced_ver_file" ] || [ "$(cat "$_app_synced_ver_file" 2>&3)" != "$_APP_VER" ]; }; then
+	if [ -n "$(ls -A "$_APP_REAL" 2>&3)" ]; then
+		# Only clean broken symlinks at depth 1 — never recurse into .wine
+		find -L "$_APP_HOME/" -maxdepth 1 -mindepth 1 -type l -delete >/dev/null 2>&3 || true
+		# First sync: hard copy so files survive AppImage unmount.
+		# Later version bumps: symlink (cp -urs) for space; broken links
+		# from a previous AppImage mount are cleaned above before re-sync.
+		if [ ! -f "$_app_synced_ver_file" ]; then
+			cp -r "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
+		else
+			cp -urs "$_APP_REAL/"* "$_APP_HOME" >/dev/null 2>&3 || true
+		fi
+	fi
+	echo "$_APP_VER" > "$_app_synced_ver_file" 2>&3 || true
+fi
+
+_app_install_icons() {
+	mkdir -p "$DATADIR/icons/hicolor/256x256/apps" \
+		"$DATADIR/icons/hicolor/scalable/apps" \
+		"$DATADIR/applications"
+	if [ -f "$APPDIR/$_APP_NAME.png" ]; then
+		cp -f "$APPDIR/$_APP_NAME.png" "$DATADIR/icons/hicolor/256x256/apps/" 2>&3 || true
+	elif [ -f "$APPDIR/$_APP_NAME.svg" ]; then
+		cp -f "$APPDIR/$_APP_NAME.svg" "$DATADIR/icons/hicolor/scalable/apps/" 2>&3 || true
+	fi
+}
+
+_app_install() {
+	_app_install_icons
+	if [ -f "$APPDIR/$_APP_NAME.desktop" ]; then
+		cp -f "$APPDIR/$_APP_NAME.desktop" "$_APP_ICOD" 2>&3 || true
+	fi
+	update-desktop-database -q 2>&3 || true
+}
+
+_app_remove() {
+	rm -f "$DATADIR/applications/$_APP_NAME.desktop"
+	rm -f "$DATADIR/icons/hicolor/256x256/apps/$_APP_NAME.png"
+	rm -f "$DATADIR/icons/hicolor/scalable/apps/$_APP_NAME.svg"
+}
+
+case "$1" in
+	install) _app_install; exit 0 ;;
+	remove)  _app_remove;  exit 0 ;;
+esac
+
+if [ ! -f "$_APP_ICON_FIX" ]; then
+	_app_install_icons
+	cat > "$_APP_ICON_FIX" << EOF
+[Desktop Entry]
+Name=$_APP_NAME
+Icon=$_APP_NAME
+NoDisplay=true
+StartupWMClass=$_APP_BIN
+EOF
+	update-desktop-database -q 2>&3 || true
+fi
+
+# ---------------------------------------------------------------------------
+# Prefix dedup — order: ensure template → app wineboot → symlink trees
+#
+# Always shared when present: system32, syswow64, winsxs
+# Also shared when Wine Mono was installed into the template:
+#   mono, Microsoft.NET, assembly  (only if mscoree is NOT disabled)
+#
+# Template wineboot uses the app's WINEDLLOVERRIDES (from make-appimage.sh /
+# env): mscoree= disables Mono, mshtml= disables Gecko. If mscoree is
+# disabled, Mono dirs will not exist. winemenubuilder.exe=d is added only
+# for the template init so menu-builder cannot hang that one-time wineboot.
+#
+# Default on — disable with WINEPREFIX_DEDUP=0 in make-appimage.sh or env.
+# ---------------------------------------------------------------------------
+WINEPREFIX_DEDUP="${WINEPREFIX_DEDUP:-WINEPREFIX_DEDUP_HERE}"
+
+_wineprefix_ensure_template() {
+	[ "$WINEPREFIX_DEDUP" = 1 ] || return 0
+
+	_tpl_root="$DATADIR/wine-appimage/.template-prefix"
+	_tpl_prefix="$_tpl_root/.wine"
+	_tpl_stamp="$_tpl_root/.wine-id"
+	_tpl_ready="$_tpl_prefix/drive_c/windows/system32"
+	# Rebuild when wine binary OR overrides change (mono on vs off)
+	_wine_id="${WINE_APPIMAGE_PATH:-$WINELOADER}|${WINEDLLOVERRIDES}"
+
+	if [ -d "$_tpl_ready" ] \
+		&& [ -f "$_tpl_stamp" ] \
+		&& [ "$(cat "$_tpl_stamp" 2>/dev/null || true)" = "$_wine_id" ]; then
+		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id
+		return 0
+	fi
+
+	rm -rf "$_tpl_root"
+	mkdir -p "$_tpl_prefix"
+
+	# App overrides + winemenubuilder only for this template wineboot
+	_tpl_ov="${WINEDLLOVERRIDES}"
+	case ";$_tpl_ov;" in
+		*winemenubuilder*) ;;
+		*) _tpl_ov="${_tpl_ov};winemenubuilder.exe=d" ;;
+	esac
+
+	WINEPREFIX="$_tpl_prefix" \
+	WINEDLLOVERRIDES="$_tpl_ov" \
+	WINEDEBUG="-all" \
+	DISABLE_AUTO_UPDATES=1 \
+		"$WINELOADER" wineboot --init 2>&3 || true
+	WINEPREFIX="$_tpl_prefix" DISABLE_AUTO_UPDATES=1 \
+		"$WINELOADER" wineserver -w 2>&3 || true
+
+	# Keep static system trees + Wine Mono trees when present
+	_win="$_tpl_prefix/drive_c/windows"
+	if [ -d "$_win" ]; then
+		for _entry in "$_win"/*; do
+			[ -e "$_entry" ] || continue
+			case "$(basename "$_entry")" in
+				system32|syswow64|winsxs|resources|globalization|mono|Microsoft.NET|assembly) ;;
+				*) rm -rf "$_entry" ;;
+			esac
+		done
+	fi
+	for _entry in "$_tpl_prefix"/* "$_tpl_prefix"/.[!.]*; do
+		[ -e "$_entry" ] || continue
+		case "$(basename "$_entry")" in
+			drive_c) ;;
+			*) rm -rf "$_entry" ;;
+		esac
+	done
+	if [ -d "$_tpl_prefix/drive_c" ]; then
+		for _entry in "$_tpl_prefix/drive_c"/*; do
+			[ -e "$_entry" ] || continue
+			case "$(basename "$_entry")" in
+				windows) ;;
+				*) rm -rf "$_entry" ;;
+			esac
+		done
+	fi
+
+	if [ ! -d "$_tpl_ready" ]; then
+		echo "WARN: prefix template missing system32 — dedup skipped" >&2
+		rm -rf "$_tpl_root"
+		unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id _tpl_ov _win _entry
+		return 1
+	fi
+	printf '%s\n' "$_wine_id" > "$_tpl_stamp"
+	unset _tpl_root _tpl_prefix _tpl_stamp _tpl_ready _wine_id _tpl_ov _win _entry
+	return 0
+}
+
+_wineprefix_dedup_symlink() {
+	_dedup_prefix="${1:-$WINEPREFIX}"
+	[ "$WINEPREFIX_DEDUP" = 1 ] || return 0
+	[ -d "$_dedup_prefix/drive_c/windows" ] || return 0
+	[ -f "$_dedup_prefix/.deduped" ] && return 0
+
+	_tpl_prefix="$DATADIR/wine-appimage/.template-prefix/.wine"
+	[ -d "$_tpl_prefix/drive_c/windows/system32" ] || return 1
+
+	# system32/syswow64/winsxs/resources/globalization always; mono trees if present
+	for _sub in system32 syswow64 winsxs resources globalization mono Microsoft.NET assembly; do
+		_src="$_tpl_prefix/drive_c/windows/$_sub"
+		_dst="$_dedup_prefix/drive_c/windows/$_sub"
+		[ -d "$_src" ] || continue
+		if [ -L "$_dst" ] && [ "$(readlink "$_dst" 2>/dev/null || true)" = "$_src" ]; then
+			continue
+		fi
+		rm -rf "$_dst"
+		ln -s "$_src" "$_dst" || true
+	done
+
+	: > "$_dedup_prefix/.deduped"
+	unset _dedup_prefix _tpl_prefix _sub _src _dst
+}
+
+# 1) Template first (shared trees), 2) app prefix, 3) link
+_wineprefix_ensure_template
+
+_app_fresh_prefix=0
+if [ ! -f "$WINEPREFIX/system.reg" ]; then
+	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineboot --init 2>&3
+	DISABLE_AUTO_UPDATES=1 "$WINELOADER" wineserver -w 2>&3 || true
+	_app_fresh_prefix=1
+fi
+
+_wineprefix_dedup_symlink "$WINEPREFIX"
+
+# AppData redirect: symlink each profile's AppData to
+# $DATADIR/wine-appimage/data/$APPNAME/AppData so settings survive prefix
+# resets and stay outside drive_c. Runs every launch (idempotent).
+REDIRECT_APPDATA="${REDIRECT_APPDATA:-1}"
+if [ "$REDIRECT_APPDATA" = 1 ]; then
+	_app_xdg_data="$DATADIR/wine-appimage/data/$_APP_NAME"
+	mkdir -p "$_app_xdg_data/AppData/Roaming" "$_app_xdg_data/AppData/Local"
+	if [ -d "$WINEPREFIX/drive_c/users" ]; then
+		for _uprofile in "$WINEPREFIX/drive_c/users"/*; do
+			[ -d "$_uprofile" ] || continue
+			case "$(basename "$_uprofile")" in
+				Public|Default*|All\ Users) continue ;;
+			esac
+			_appdata="$_uprofile/AppData"
+			if [ -L "$_appdata" ]; then
+				[ "$(readlink "$_appdata" 2>/dev/null || true)" = "$_app_xdg_data/AppData" ] && continue
+				rm -f "$_appdata"
+			elif [ -d "$_appdata" ]; then
+				# One-time copy of existing prefix AppData into the XDG tree
+				if [ ! -f "$_app_xdg_data/.migrated-from-prefix" ]; then
+					cp -a "$_appdata/." "$_app_xdg_data/AppData/" 2>&3 || true
+					: > "$_app_xdg_data/.migrated-from-prefix"
+				fi
+				rm -rf "$_appdata"
+			fi
+			ln -sfn "$_app_xdg_data/AppData" "$_appdata"
+		done
+	fi
+fi
+
+TRICKS="${TRICKS:-TRICKS_HERE}"
+
+if [ -n "$TRICKS" ] && [ ! -f "$WINEPREFIX/.tricks-applied" ]; then
+	echo "Installing winetricks verbs: $TRICKS" 2>&3
+	# Same rules as the `winetricks` subcommand: real AppImage path, clear
+	# WINE/WINELOADER so winetricks finds ELF binaries on the mount PATH.
+	# One wineserver -k before/after the batch (not per verb) — each kill
+	# starts the wine AppImage. No --force: reuse downloads and skip
+	# verbs already present in the prefix on retry.
+	_wai="${WINE_APPIMAGE_PATH:-$WINELOADER}"
+	DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+		"$_wai" wineserver -k >/dev/null 2>&3 || true
+	IFS=' '
+	_tricks_ok=1
+	for _trick in $TRICKS; do
+		unset IFS
+		if ! DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+			"$_wai" winetricks --unattended "$_trick" 2>&3; then
+			echo "winetricks verb failed: $_trick" >&2
+			_tricks_ok=0
+		fi
+	done
+	unset IFS
+	DISABLE_AUTO_UPDATES=1 WINE= WINELOADER= \
+		"$_wai" wineserver -k >/dev/null 2>&3 || true
+	# Only mark applied if every verb succeeded
+	if [ "$_tricks_ok" = 1 ]; then
+		touch "$WINEPREFIX/.tricks-applied"
+	fi
+fi
+
+export INSTALL_URL="${INSTALL_URL:-INSTALL_URL_HERE}"
+export RUN_EXE="${RUN_EXE:-RUN_EXE_HERE}"
+# Space-separated silent flags for .exe/.msi runtime install (patched by
+# make-appimage.sh). Empty → type-specific defaults in _app_install_payload.
+INSTALL_FLAGS="${INSTALL_FLAGS:-INSTALL_FLAGS_HERE}"
+
+# Case-insensitive existence (Linux FS vs Windows exe names)
+_app_ci_exists() {
+	_ci_dir=$(dirname "$1")
+	_ci_base=$(basename "$1")
+	[ -d "$_ci_dir" ] && [ -n "$(find "$_ci_dir" -maxdepth 1 -mindepth 1 -iname "$_ci_base" -print -quit 2>/dev/null)" ]
+}
+
+_app_install_payload() {
+	_pkg_src="$1"
+	_pkg_is_local=0
+	_pkg_dest="$WINEPREFIX/drive_c/$_APP_NAME"
+
+	case "$_pkg_src" in
+		http://*|https://*)
+			_pkg_file="$CACHEDIR/$(basename "${_pkg_src%%\?*}")"
+			[ -d "$CACHEDIR" ] || mkdir -p "$CACHEDIR"
+			# Reuse cached download when present (version bumps change URL/basename).
+			if [ ! -s "$_pkg_file" ]; then
+				if command -v wget >/dev/null 2>&1; then
+					wget -q "$_pkg_src" -O "$_pkg_file" \
+						|| { echo "Download failed: $_pkg_src" >&2; rm -f "$_pkg_file"; return 1; }
+				else
+					echo "No wget found to download $_pkg_src" >&2
+					return 1
+				fi
+			fi
+			;;
+		*)
+			_pkg_file="$_pkg_src"
+			_pkg_is_local=1
+			[ -f "$_pkg_file" ] || { echo "Not found: $_pkg_file" >&2; return 1; }
+			;;
+	esac
+
+	# Extract archives to temp, then flatten a single top-level folder
+	case "$_pkg_file" in
+		*.zip|*.tar.xz|*.txz|*.tar.gz|*.tgz|*.7z)
+			_pkg_tmp="$CACHEDIR/$_APP_NAME-extract-$$"
+			rm -rf "$_pkg_tmp"
+			mkdir -p "$_pkg_tmp"
+
+			case "$_pkg_file" in
+				*.zip)
+					command -v unzip >/dev/null 2>&1 || {
+						echo "No unzip found to extract $_pkg_file" >&2; return 1
+					}
+					unzip -q -o "$_pkg_file" -d "$_pkg_tmp" || return 1
+					;;
+				*.tar.xz|*.txz|*.tar.gz|*.tgz)
+					command -v tar >/dev/null 2>&1 || {
+						echo "No tar found to extract $_pkg_file" >&2; return 1
+					}
+					case "$_pkg_file" in
+						*.tar.xz|*.txz) tar -xJf "$_pkg_file" -C "$_pkg_tmp" || return 1 ;;
+						*)              tar -xzf "$_pkg_file" -C "$_pkg_tmp" || return 1 ;;
+					esac
+					;;
+				*.7z)
+					command -v 7z >/dev/null 2>&1 || {
+						echo "No 7z found to extract $_pkg_file" >&2; return 1
+					}
+					7z x -o"$_pkg_tmp" -y "$_pkg_file" >/dev/null || return 1
+					;;
+			esac
+
+			# Count items at root of extraction
+			_pkg_items=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 | wc -l | tr -d ' ')
+			_pkg_dirs=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')
+			_pkg_files=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 -type f | wc -l | tr -d ' ')
+
+			mkdir -p "$_pkg_dest"
+
+			if [ "$_pkg_items" -eq 1 ] && [ "$_pkg_dirs" -eq 1 ] && [ "$_pkg_files" -eq 0 ]; then
+				# Exactly one directory at root, no files — flatten it
+				_pkg_inner=$(find "$_pkg_tmp" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+				mv "$_pkg_inner"/* "$_pkg_dest/" 2>/dev/null || true
+				mv "$_pkg_inner"/.[!.]* "$_pkg_dest/" 2>/dev/null || true
+				rmdir "$_pkg_inner" 2>/dev/null || true
+			else
+				mv "$_pkg_tmp"/* "$_pkg_dest/" 2>/dev/null || true
+				mv "$_pkg_tmp"/.[!.]* "$_pkg_dest/" 2>/dev/null || true
+			fi
+			rm -rf "$_pkg_tmp"
+			;;
+		*.msi)
+			_inst_flags="${INSTALL_FLAGS:-/qn /norestart}"
+			# shellcheck disable=SC2086 — intentional word-split of flags
+			DISABLE_AUTO_UPDATES=1 "$WINELOADER" msiexec /i "$_pkg_file" $_inst_flags || return 1
+			;;
+		*.exe)
+			_inst_flags="${INSTALL_FLAGS:-/S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART}"
+			# shellcheck disable=SC2086 — intentional word-split of flags
+			DISABLE_AUTO_UPDATES=1 "$WINELOADER" "$_pkg_file" $_inst_flags || return 1
+			;;
+		*)
+			echo "Unrecognized installer type: $_pkg_file" >&2
+			[ "$_pkg_is_local" = 0 ] && rm -f "$_pkg_file"
+			return 1
+			;;
+	esac
+
+	[ "$_pkg_is_local" = 0 ] && rm -f "$_pkg_file"
+
+	case "$_pkg_file" in
+		*.exe|*.msi)
+			_desktop_dir="$(xdg-user-dir DESKTOP 2>&3)"
+			# Only remove .lnk files matching our app name
+			if [ -n "$_desktop_dir" ] && [ -n "$_APP_NAME" ]; then
+				find "$_desktop_dir" -maxdepth 1 -name "*${_APP_NAME}*.lnk" -delete 2>&3 || true
+			fi
+			;;
+	esac
+}
+
+_app_winpath_to_unix() {
+	_wp="$1"
+	case "$_wp" in
+		/*) printf '%s\n' "$_wp" ;;
+		[A-Za-z]:*)
+			_drive=$(printf '%s' "${_wp%"${_wp#?}"}" | tr 'A-Z' 'a-z')
+			_rest=$(printf '%s' "${_wp#??}" | tr '\\' '/')
+			printf '%s\n' "$WINEPREFIX/drive_${_drive}${_rest}"
+			;;
+		*) printf '%s\n' "$WINEPREFIX/drive_c/$(printf '%s' "$_wp" | tr '\\' '/')" ;;
+	esac
+}
+
+if [ -n "$INSTALL_URL" ] && [ -n "$RUN_EXE" ]; then
+	_run_exe_unix="$(_app_winpath_to_unix "$RUN_EXE")"
+	_installed_ver_file="$_APP_HOME/.installed_version"
+	_need_install=0
+	# Case-insensitive check for exe on Linux filesystems
+	if [ ! -f "$_run_exe_unix" ] && ! _app_ci_exists "$_run_exe_unix"; then
+		_need_install=1
+	elif [ ! -f "$_installed_ver_file" ] || [ "$(cat "$_installed_ver_file" 2>&3)" != "$_APP_VER" ]; then
+		_need_install=1
+	fi
+
+	if [ "$_need_install" = 1 ]; then
+		echo "Installing $_APP_NAME..." 2>&3
+		# Only stamp version when the expected exe is actually present
+		if _app_install_payload "$INSTALL_URL"; then
+			if [ -f "$_run_exe_unix" ] || _app_ci_exists "$_run_exe_unix"; then
+				echo "$_APP_VER" > "$_installed_ver_file"
+			else
+				echo "WARN: install finished but $RUN_EXE not found under prefix" >&2
+			fi
+		fi
+	fi
+	unset _run_exe_unix _installed_ver_file _need_install
+fi
+
+# Translate existing host paths to Wine paths. Absolute paths use the default
+# Z:\ mapping (no wine process). Relative/odd paths fall back to winepath.
+if [ "$#" -gt 0 ]; then
+	_app_argc=$#
+	while [ "$_app_argc" -gt 0 ]; do
+		_app_arg="$1"; shift; _app_argc=$((_app_argc - 1))
+		if [ -e "$_app_arg" ]; then
+			case "$_app_arg" in
+				/*)
+					# Z: → /  (Wine default). Avoid spawning wine-AppImage per arg.
+					_app_wp=$(printf 'Z:%s' "$_app_arg" | sed 's|/|\\|g')
+					set -- "$@" "$_app_wp"
+					;;
+				*)
+					set -- "$@" "$(DISABLE_AUTO_UPDATES=1 "$WINELOADER" winepath -w "$_app_arg")"
+					;;
+			esac
+		else
+			set -- "$@" "$_app_arg"
+		fi
+	done
+fi
