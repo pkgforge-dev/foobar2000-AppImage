@@ -111,6 +111,9 @@ wget -q https://www.foobar2000.org/encoderpack -nH --cut-dirs=3 -r -l 2 -A exe
 7z x -aos "Free_*.exe" \
 	-x'!$PLUGINSDIR' -x'!qaac64.exe' -x'!refalac64.exe' \
 	-o"AppDir/share/$APPNAME/encoders"
+
+touch AppDir/share/$APPNAME/portable_mode_enabled
+
 # # Installer exe names often don't match the real Windows binary name —
 # # rename here so it matches MAIN_EXE:
 # # mv "AppDir/share/$APPNAME/some-installed-name.exe" "AppDir/share/$APPNAME/$MAIN_EXE"
